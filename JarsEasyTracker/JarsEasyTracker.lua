@@ -118,6 +118,7 @@ local DEFAULT_ELEMENT = {
     desaturateInactive = true,
     showGlow = false,
     glowStyle = "glow",
+    groupOrder = 0,
     stackPosition = "CENTER",
     timerPosition = "BOTTOM",
     iconAlpha = 1.0,
@@ -343,6 +344,35 @@ local function ShouldLoad(element)
     return true
 end
 
+-- Collect and sort group members by groupOrder
+local function GetGroupMembersSorted(groupId, requireLoaded)
+    local members = {}
+    for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
+        if element.positioning == "grouped" and element.groupId == groupId then
+            if not requireLoaded or ShouldLoad(element) then
+                table.insert(members, element)
+            end
+        end
+    end
+    table.sort(members, function(a, b)
+        return (a.groupOrder or 0) < (b.groupOrder or 0)
+    end)
+    return members
+end
+
+-- Get the next groupOrder value for a group
+local function GetNextGroupOrder(groupId)
+    local maxOrder = 0
+    for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
+        if element.positioning == "grouped" and element.groupId == groupId then
+            if (element.groupOrder or 0) > maxOrder then
+                maxOrder = element.groupOrder or 0
+            end
+        end
+    end
+    return maxOrder + 1
+end
+
 --------------------------------------------------------------------------------
 -- Section 5: Trigger Engine — State Management
 --------------------------------------------------------------------------------
@@ -459,6 +489,7 @@ end
 UpdateSpellDataElement = function(element, state)
     if not element.spelldata or not element.spelldata.actionSlot or element.spelldata.actionSlot == 0 then
         state.active = false
+        state.overlayActive = false
         return
     end
     local actionSlot = element.spelldata.actionSlot
@@ -466,8 +497,15 @@ UpdateSpellDataElement = function(element, state)
         local actionType, id = GetActionInfo(actionSlot)
         state.actionSpellId = (actionType == "spell") and id or nil
         state.active = true
+        -- Check if the spell currently has an overlay glow active
+        if state.actionSpellId and IsSpellOverlayed and IsSpellOverlayed(state.actionSpellId) then
+            state.overlayActive = true
+        elseif not state.overlayActive then
+            state.overlayActive = false
+        end
     else
         state.active = false
+        state.overlayActive = false
     end
 end
 
@@ -673,30 +711,34 @@ local function CreateIconDisplay(element)
         f.timerText:SetPoint(timerPos.point, timerPos.x, timerPos.y)
     end
 
-    -- Glow overlays (multiple styles)
+    -- Glow overlays (multiple styles) — use a child frame so glow renders above the icon
     local glowPad = math.max(10, element.iconSize * 0.25)
 
+    f.glowFrame = CreateFrame("Frame", nil, f)
+    f.glowFrame:SetAllPoints()
+    f.glowFrame:SetFrameLevel(f:GetFrameLevel() + 5)
+
     -- Style: glow (static) / pulse / proc — all use this base texture
-    f.glow = f:CreateTexture(nil, "OVERLAY", nil, 6)
-    f.glow:SetPoint("TOPLEFT", -glowPad, glowPad)
-    f.glow:SetPoint("BOTTOMRIGHT", glowPad, -glowPad)
+    f.glow = f.glowFrame:CreateTexture(nil, "OVERLAY", nil, 7)
+    f.glow:SetPoint("TOPLEFT", f, "TOPLEFT", -glowPad, glowPad)
+    f.glow:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", glowPad, -glowPad)
     f.glow:SetTexture("Interface\\SpellActivationOverlay\\IconAlert")
     f.glow:SetTexCoord(0.00781250, 0.50781250, 0.27734375, 0.52734375)
     f.glow:SetBlendMode("ADD")
-    f.glow:SetAlpha(0.4)
+    f.glow:SetAlpha(1.0)
     f.glow:Hide()
 
     -- Pulse animation group (for "pulse" style)
     f.glowPulseAG = f.glow:CreateAnimationGroup()
     local pulseOut = f.glowPulseAG:CreateAnimation("Alpha")
-    pulseOut:SetFromAlpha(0.4)
-    pulseOut:SetToAlpha(0.15)
+    pulseOut:SetFromAlpha(1.0)
+    pulseOut:SetToAlpha(0.4)
     pulseOut:SetDuration(0.6)
     pulseOut:SetOrder(1)
     pulseOut:SetSmoothing("IN_OUT")
     local pulseIn = f.glowPulseAG:CreateAnimation("Alpha")
-    pulseIn:SetFromAlpha(0.15)
-    pulseIn:SetToAlpha(0.4)
+    pulseIn:SetFromAlpha(0.4)
+    pulseIn:SetToAlpha(1.0)
     pulseIn:SetDuration(0.6)
     pulseIn:SetOrder(2)
     pulseIn:SetSmoothing("IN_OUT")
@@ -705,27 +747,27 @@ local function CreateIconDisplay(element)
     -- Proc glow animation (alpha throb on base glow for "proc" style)
     f.glowProcAG = f.glow:CreateAnimationGroup()
     local procAlphaOut = f.glowProcAG:CreateAnimation("Alpha")
-    procAlphaOut:SetFromAlpha(0.4)
-    procAlphaOut:SetToAlpha(0.2)
+    procAlphaOut:SetFromAlpha(1.0)
+    procAlphaOut:SetToAlpha(0.5)
     procAlphaOut:SetDuration(0.4)
     procAlphaOut:SetOrder(1)
     procAlphaOut:SetSmoothing("IN_OUT")
     local procAlphaIn = f.glowProcAG:CreateAnimation("Alpha")
-    procAlphaIn:SetFromAlpha(0.2)
-    procAlphaIn:SetToAlpha(0.4)
+    procAlphaIn:SetFromAlpha(0.5)
+    procAlphaIn:SetToAlpha(1.0)
     procAlphaIn:SetDuration(0.4)
     procAlphaIn:SetOrder(2)
     procAlphaIn:SetSmoothing("IN_OUT")
     f.glowProcAG:SetLooping("REPEAT")
 
     -- Proc ants texture (spinning sparkle border for "proc" style)
-    f.glowAnts = f:CreateTexture(nil, "OVERLAY", nil, 7)
-    f.glowAnts:SetPoint("TOPLEFT", -glowPad, glowPad)
-    f.glowAnts:SetPoint("BOTTOMRIGHT", glowPad, -glowPad)
+    f.glowAnts = f.glowFrame:CreateTexture(nil, "OVERLAY", nil, 7)
+    f.glowAnts:SetPoint("TOPLEFT", f, "TOPLEFT", -glowPad, glowPad)
+    f.glowAnts:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", glowPad, -glowPad)
     f.glowAnts:SetTexture("Interface\\SpellActivationOverlay\\IconAlert")
     f.glowAnts:SetTexCoord(0.00781250, 0.50781250, 0.53515625, 0.78515625)
     f.glowAnts:SetBlendMode("ADD")
-    f.glowAnts:SetAlpha(0.35)
+    f.glowAnts:SetAlpha(0.8)
     f.glowAnts:Hide()
 
     -- Ants rotation animation
@@ -736,10 +778,10 @@ local function CreateIconDisplay(element)
     f.glowAntsAG:SetLooping("REPEAT")
 
     -- Border highlight style
-    f.glowBorder = f:CreateTexture(nil, "OVERLAY", nil, 5)
-    f.glowBorder:SetPoint("TOPLEFT", -3, 3)
-    f.glowBorder:SetPoint("BOTTOMRIGHT", 3, -3)
-    f.glowBorder:SetColorTexture(1, 0.82, 0, 0.35)
+    f.glowBorder = f.glowFrame:CreateTexture(nil, "OVERLAY", nil, 7)
+    f.glowBorder:SetPoint("TOPLEFT", f, "TOPLEFT", -3, 3)
+    f.glowBorder:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", 3, -3)
+    f.glowBorder:SetColorTexture(1, 0.82, 0, 0.6)
     f.glowBorder:Hide()
 
     -- Cooldown sweep overlay (for spelldata action bar style)
@@ -921,13 +963,13 @@ local function UpdateIconDisplay(element, state, f)
     local glowPad = math.max(10, element.iconSize * 0.25)
     if f.glow then
         f.glow:ClearAllPoints()
-        f.glow:SetPoint("TOPLEFT", -glowPad, glowPad)
-        f.glow:SetPoint("BOTTOMRIGHT", glowPad, -glowPad)
+        f.glow:SetPoint("TOPLEFT", f, "TOPLEFT", -glowPad, glowPad)
+        f.glow:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", glowPad, -glowPad)
     end
     if f.glowAnts then
         f.glowAnts:ClearAllPoints()
-        f.glowAnts:SetPoint("TOPLEFT", -glowPad, glowPad)
-        f.glowAnts:SetPoint("BOTTOMRIGHT", glowPad, -glowPad)
+        f.glowAnts:SetPoint("TOPLEFT", f, "TOPLEFT", -glowPad, glowPad)
+        f.glowAnts:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", glowPad, -glowPad)
     end
 
     -- Update texture
@@ -1008,7 +1050,12 @@ local function UpdateIconDisplay(element, state, f)
         f.icon:SetDesaturated(false)
         f:SetAlpha(element.iconAlpha or 1)
         f:Show()
-        HideGlowEffect(f)  -- glow managed by SPELL_ACTIVATION_OVERLAY events
+        -- Show/hide glow based on overlay state (set by SPELL_ACTIVATION events)
+        if state.overlayActive then
+            ShowGlowEffect(f, element.glowStyle or "glow")
+        else
+            HideGlowEffect(f)
+        end
         if f.cooldown then f.cooldown:Show() end
     end
 
@@ -1359,13 +1406,8 @@ UpdateGroupLayout = function(group)
         return
     end
 
-    -- Find elements belonging to this group
-    local members = {}
-    for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
-        if element.positioning == "grouped" and element.groupId == group.id and ShouldLoad(element) then
-            table.insert(members, element)
-        end
-    end
+    -- Find elements belonging to this group (sorted by groupOrder)
+    local members = GetGroupMembersSorted(group.id, true)
 
     if #members == 0 then
         if groupFrames[group.id] then
@@ -1580,6 +1622,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             if element.triggerType == "spelldata" and ShouldLoad(element) then
                 local state = GetElementState(element.id)
                 if state and state.actionSpellId == spellID then
+                    state.overlayActive = true
                     local f = displayFrames[element.id]
                     if f then ShowGlowEffect(f, element.glowStyle or "glow") end
                 end
@@ -1592,6 +1635,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             if element.triggerType == "spelldata" and ShouldLoad(element) then
                 local state = GetElementState(element.id)
                 if state and state.actionSpellId == spellID then
+                    state.overlayActive = false
                     local f = displayFrames[element.id]
                     if f then HideGlowEffect(f) end
                 end
@@ -2474,12 +2518,11 @@ local function CreateConfigWindow()
             table.insert(leftPanelEntries, header)
             yOff = yOff + 25
 
-            -- Render member elements (if not collapsed)
+            -- Render member elements (if not collapsed), sorted by groupOrder
             if not isCollapsed then
-                for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
-                    if element.positioning == "grouped" and element.groupId == group.id then
-                        CreateElementRow(element, 10)
-                    end
+                local sortedMembers = GetGroupMembersSorted(group.id, false)
+                for _, element in ipairs(sortedMembers) do
+                    CreateElementRow(element, 10)
                 end
             end
         end
@@ -2862,6 +2905,103 @@ local function CreateConfigWindow()
         end)
         nameFilterBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
         yOff = yOff - 28
+
+        -----------------------------------------------------------------------
+        -- MEMBER ORDER
+        -----------------------------------------------------------------------
+        SectionHeader("Member Order")
+
+        local sortedMembers = GetGroupMembersSorted(group.id, false)
+        if #sortedMembers == 0 then
+            local noMembers = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            noMembers:SetPoint("TOPLEFT", leftMargin, yOff)
+            noMembers:SetText("|cff888888No members in this group|r")
+            yOff = yOff - 22
+        else
+            for i, member in ipairs(sortedMembers) do
+                -- Row background
+                local rowBg = parent:CreateTexture(nil, "BACKGROUND")
+                rowBg:SetPoint("TOPLEFT", leftMargin, yOff)
+                rowBg:SetSize(420, 22)
+                if i % 2 == 0 then
+                    rowBg:SetColorTexture(0.15, 0.15, 0.18, 0.5)
+                else
+                    rowBg:SetColorTexture(0.12, 0.12, 0.14, 0.3)
+                end
+
+                -- Index number
+                local idxLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                idxLabel:SetPoint("TOPLEFT", leftMargin + 4, yOff - 4)
+                idxLabel:SetText("|cffaaaaaa" .. i .. ".|r")
+
+                -- Type indicator
+                local typeLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                typeLabel:SetPoint("LEFT", idxLabel, "RIGHT", 4, 0)
+                if member.elementType == "icon" then
+                    typeLabel:SetText("|cff80ccff[I]|r")
+                else
+                    typeLabel:SetText("|cff80ff80[B]|r")
+                end
+
+                -- Name
+                local nameLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                nameLabel:SetPoint("LEFT", typeLabel, "RIGHT", 4, 0)
+                nameLabel:SetText(member.name)
+                nameLabel:SetWidth(250)
+                nameLabel:SetJustifyH("LEFT")
+                nameLabel:SetWordWrap(false)
+
+                -- Move Up button
+                if i > 1 then
+                    local upBtn = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
+                    upBtn:SetSize(28, 18)
+                    upBtn:SetPoint("TOPLEFT", leftMargin + 340, yOff - 1)
+                    upBtn:SetText("Up")
+                    upBtn:SetScript("OnClick", function()
+                        -- Swap groupOrder with the previous member
+                        local prev = sortedMembers[i - 1]
+                        local prevOrder = prev.groupOrder or 0
+                        local curOrder = member.groupOrder or 0
+                        prev.groupOrder = curOrder
+                        member.groupOrder = prevOrder
+                        -- If they were equal, force distinct values
+                        if prev.groupOrder == member.groupOrder then
+                            member.groupOrder = member.groupOrder - 1
+                        end
+                        UpdateGroupLayout(group)
+                        RefreshLeftPanel()
+                        PopulateGroupPanel(group)
+                    end)
+                end
+
+                -- Move Down button
+                if i < #sortedMembers then
+                    local downBtn = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
+                    downBtn:SetSize(28, 18)
+                    downBtn:SetPoint("TOPLEFT", leftMargin + 372, yOff - 1)
+                    downBtn:SetText("Dn")
+                    downBtn:SetScript("OnClick", function()
+                        -- Swap groupOrder with the next member
+                        local nxt = sortedMembers[i + 1]
+                        local nxtOrder = nxt.groupOrder or 0
+                        local curOrder = member.groupOrder or 0
+                        nxt.groupOrder = curOrder
+                        member.groupOrder = nxtOrder
+                        -- If they were equal, force distinct values
+                        if nxt.groupOrder == member.groupOrder then
+                            member.groupOrder = member.groupOrder + 1
+                        end
+                        UpdateGroupLayout(group)
+                        RefreshLeftPanel()
+                        PopulateGroupPanel(group)
+                    end)
+                end
+
+                yOff = yOff - 24
+            end
+        end
+
+        yOff = yOff - 8
 
         -- Set content height
         local totalH = math.abs(yOff) + 20
@@ -3761,6 +3901,7 @@ local function CreateConfigWindow()
                         function() return element.groupId == grp.id end,
                         function()
                             element.groupId = grp.id
+                            element.groupOrder = GetNextGroupOrder(grp.id)
                             ApplyChanges()
                             for _, g in ipairs(JarsEasyTrackerCharDB.groups) do
                                 UpdateGroupLayout(g)
