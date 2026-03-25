@@ -37,7 +37,7 @@ local leftPanelEntries = {}
 local RefreshAllDisplays, UpdateDisplay, DestroyDisplay, CreateDisplay
 local RefreshLeftPanel, PopulateRightPanel, PopulateGroupPanel, ClearRightPanel
 local UpdateGroupLayout, RegisterDynamicEvents
-local UpdateAuraElement, UpdateSpellDataElement
+local UpdateAuraElement
 
 --------------------------------------------------------------------------------
 -- Section 2: Constants
@@ -143,8 +143,13 @@ local DEFAULT_ELEMENT = {
         showStacks = true,
         showDuration = true,
     },
-    spelldata = {
-        actionSlot = 0,
+    cooldown = {
+        spellId = 0,
+        cooldown = 0,
+        stacks = 0,
+        resetId = 0,
+        haste = false,
+        alwaysShow = false,
     },
     loadConditions = {
         class = nil,
@@ -378,18 +383,18 @@ end
 --------------------------------------------------------------------------------
 
 local function InitElementState(element)
+    local maxStacks = 1
+    if element.triggerType == "cooldown" and element.cooldown then
+        maxStacks = (element.cooldown.stacks and element.cooldown.stacks > 0) and element.cooldown.stacks or 1
+    end
     elementStates[element.id] = {
         stacks = 0,
         duration = 0,
         expirationTime = 0,
         active = false,
-        -- spelldata specific
-        cooldownStart = 0,
-        cooldownDuration = 0,
-        charges = 0,
-        maxCharges = 0,
-        chargeCooldownStart = 0,
-        chargeCooldownDuration = 0,
+        -- cooldown tracker specific
+        cooldownStacks = maxStacks,
+        cooldownTimers = {},
     }
 end
 
@@ -402,6 +407,54 @@ end
 --------------------------------------------------------------------------------
 
 local function OnSpellCastSucceeded(spellId)
+    -- Handle cooldown tracker elements
+    for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
+        if element.triggerType == "cooldown" and ShouldLoad(element) then
+            local cd = element.cooldown
+            if cd and (cd.spellId or 0) > 0 then
+                local state = GetElementState(element.id)
+                if not state then
+                    InitElementState(element)
+                    state = GetElementState(element.id)
+                end
+                local maxStacks = (cd.stacks and cd.stacks > 0) and cd.stacks or 1
+                state.cooldownStacks = math.min(state.cooldownStacks or maxStacks, maxStacks)
+
+                -- Main spell cast: consume a stack and queue a timer
+                if cd.spellId == spellId then
+                    if state.cooldownStacks > 0 then
+                        state.cooldownStacks = state.cooldownStacks - 1
+                    end
+                    local startTime = GetTime()
+                    -- Queue sequentially after the last existing timer
+                    if #state.cooldownTimers > 0 then
+                        local latestEnd = 0
+                        for _, entry in ipairs(state.cooldownTimers) do
+                            if entry.endTime > latestEnd then latestEnd = entry.endTime end
+                        end
+                        startTime = latestEnd
+                    end
+                    local cdValue = cd.cooldown or 0
+                    if cd.haste and cdValue > 0 then
+                        local hastePercent = UnitSpellHaste("player")
+                        cdValue = cdValue / (1 + hastePercent / 100)
+                    end
+                    if cdValue > 0 then
+                        table.insert(state.cooldownTimers, { start = startTime, endTime = startTime + cdValue })
+                    end
+                    UpdateDisplay(element)
+                end
+
+                -- Reset spell cast: restore all stacks and clear timers
+                if (cd.resetId or 0) > 0 and cd.resetId == spellId then
+                    state.cooldownStacks = maxStacks
+                    state.cooldownTimers = {}
+                    UpdateDisplay(element)
+                end
+            end
+        end
+    end
+
     for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
         if element.triggerType == "spellcast" and ShouldLoad(element) then
             local state = GetElementState(element.id)
@@ -479,33 +532,6 @@ UpdateAuraElement = function(element, state)
         state.duration = 0
         state.expirationTime = 0
         state.active = false
-    end
-end
-
---------------------------------------------------------------------------------
--- Section 8: Trigger Engine — SpellData Handler
---------------------------------------------------------------------------------
-
-UpdateSpellDataElement = function(element, state)
-    if not element.spelldata or not element.spelldata.actionSlot or element.spelldata.actionSlot == 0 then
-        state.active = false
-        state.overlayActive = false
-        return
-    end
-    local actionSlot = element.spelldata.actionSlot
-    if HasAction(actionSlot) then
-        local actionType, id = GetActionInfo(actionSlot)
-        state.actionSpellId = (actionType == "spell") and id or nil
-        state.active = true
-        -- Check if the spell currently has an overlay glow active
-        if state.actionSpellId and IsSpellOverlayed and IsSpellOverlayed(state.actionSpellId) then
-            state.overlayActive = true
-        elseif not state.overlayActive then
-            state.overlayActive = false
-        end
-    else
-        state.active = false
-        state.overlayActive = false
     end
 end
 
@@ -653,19 +679,17 @@ end
 
 local function CreateIconDisplay(element)
     local f = CreateFrame("Frame", "JET_Icon_" .. element.id, UIParent)
-    f:SetSize(element.iconSize, element.iconSize)
-    f:SetMovable(true)
-    f:SetClampedToScreen(true)
-    f.elementId = element.id
 
     -- Icon texture
     f.icon = f:CreateTexture(nil, "ARTWORK")
     f.icon:SetAllPoints()
     f.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
 
-    -- Set texture
+    -- Set texture: for cooldown type use cooldown.spellId, otherwise iconSpellId
     local texturePath
-    if element.iconSpellId and element.iconSpellId > 0 then
+    if element.triggerType == "cooldown" and element.cooldown and (element.cooldown.spellId or 0) > 0 then
+        texturePath = C_Spell and C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(element.cooldown.spellId)
+    elseif element.iconSpellId and element.iconSpellId > 0 then
         texturePath = C_Spell and C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(element.iconSpellId)
     end
     if not texturePath and element.iconTexture then
@@ -688,6 +712,11 @@ local function CreateIconDisplay(element)
     f.bg:SetPoint("TOPLEFT", -1, 1)
     f.bg:SetPoint("BOTTOMRIGHT", 1, -1)
     f.bg:SetColorTexture(0, 0, 0, 0.8)
+
+    f:SetSize(element.iconSize, element.iconSize)
+    f:SetMovable(true)
+    f:SetClampedToScreen(true)
+    f.elementId = element.id
 
     -- Stack text (positioned via element settings)
     f.stackText = f:CreateFontString(nil, "OVERLAY")
@@ -784,7 +813,7 @@ local function CreateIconDisplay(element)
     f.glowBorder:SetColorTexture(1, 0.82, 0, 0.6)
     f.glowBorder:Hide()
 
-    -- Cooldown sweep overlay (for spelldata action bar style)
+    -- Cooldown sweep overlay
     f.cooldown = CreateFrame("Cooldown", nil, f, "CooldownFrameTemplate")
     f.cooldown:SetAllPoints(f.icon)
     f.cooldown:SetDrawEdge(false)
@@ -799,6 +828,7 @@ local function CreateIconDisplay(element)
     -- Drag handling
     f:RegisterForDrag("LeftButton")
     f:SetScript("OnDragStart", function(self)
+        if InCombatLockdown() then return end  -- secure frames cannot be moved in combat
         if not JarsEasyTrackerCharDB.locked or self.manualUnlock then
             self:StartMoving()
         end
@@ -825,31 +855,29 @@ local function CreateIconDisplay(element)
         local elem = FindElementById(self.elementId)
         if not elem then return end
 
-        -- Timer display (not for spelldata — cooldown frame handles it)
-        if elem.triggerType ~= "spelldata" then
-            if elem.showTimer and state.expirationTime > 0 then
-                local remaining = state.expirationTime - GetTime()
-                if remaining > 0 then
-                    self.timerText:SetText(string.format("%.1f", remaining))
-                    self.timerText:Show()
-                else
-                    self.timerText:SetText("")
-                    self.timerText:Hide()
-                    -- Auto-expire for spellcast triggers
-                    if elem.triggerType == "spellcast" then
-                        state.stacks = 0
-                        state.expirationTime = 0
-                        state.duration = 0
-                        state.active = false
-                        UpdateDisplay(elem)
-                    end
-                end
+        -- Timer display
+        if elem.showTimer and state.expirationTime and state.expirationTime > 0 then
+            local remaining = state.expirationTime - GetTime()
+            if remaining > 0 then
+                self.timerText:SetText(string.format("%.1f", remaining))
+                self.timerText:Show()
             else
+                self.timerText:SetText("")
                 self.timerText:Hide()
+                -- Auto-expire for spellcast triggers
+                if elem.triggerType == "spellcast" then
+                    state.stacks = 0
+                    state.expirationTime = 0
+                    state.duration = 0
+                    state.active = false
+                    UpdateDisplay(elem)
+                end
             end
+        else
+            self.timerText:Hide()
         end
 
-        -- Update aura/spelldata on each frame (throttled internally by WoW)
+        -- Update aura/cooldown on each frame
         if elem.triggerType == "aura" then
             UpdateAuraElement(elem, state)
             -- Update stack display
@@ -875,77 +903,100 @@ local function CreateIconDisplay(element)
             else
                 self:Hide()
             end
-        elseif elem.triggerType == "spelldata" then
-            local actionSlot = elem.spelldata and elem.spelldata.actionSlot
-            if actionSlot and actionSlot > 0 and HasAction(actionSlot) then
-                -- Update spell ID for glow event matching
-                UpdateSpellDataElement(elem, state)
+        elseif elem.triggerType == "cooldown" then
+            local cd = elem.cooldown
+            if not cd then return end
+            local maxStacks = (cd.stacks and cd.stacks > 0) and cd.stacks or 1
+            if state.cooldownStacks == nil then state.cooldownStacks = maxStacks end
+            if state.cooldownTimers == nil then state.cooldownTimers = {} end
+            state.cooldownStacks = math.min(state.cooldownStacks, maxStacks)
 
-                -- Update texture
-                local texture = GetActionTexture(actionSlot)
-                if texture and self._lastTexture ~= texture then
-                    self.icon:SetTexture(texture)
-                    self._lastTexture = texture
-                end
-
-                -- Cooldown - pass directly, CooldownFrame handles secrets
-                if self.cooldown then
-                    if C_ActionBar and C_ActionBar.GetActionCooldown then
-                        local cooldownInfo = C_ActionBar.GetActionCooldown(actionSlot)
-                        if cooldownInfo and cooldownInfo.startTime and cooldownInfo.duration then
-                            self.cooldown:SetCooldown(cooldownInfo.startTime, cooldownInfo.duration)
-                        end
+            -- Expire timers and restore stacks
+            local now = GetTime()
+            if #state.cooldownTimers > 0 then
+                local newTimers = {}
+                for _, entry in ipairs(state.cooldownTimers) do
+                    if entry.endTime > now then
+                        table.insert(newTimers, entry)
                     else
-                        local start, duration = GetActionCooldown(actionSlot)
-                        if start and duration then
-                            self.cooldown:SetCooldown(start, duration)
-                        end
-                    end
-                    if not self.cooldown:IsShown() then
-                        self.cooldown:Show()
+                        state.cooldownStacks = math.min(state.cooldownStacks + 1, maxStacks)
                     end
                 end
+                state.cooldownTimers = newTimers
+            end
 
-                -- Count display (charges, ammo, etc)
-                if C_ActionBar and C_ActionBar.GetActionDisplayCount then
-                    local displayCount = C_ActionBar.GetActionDisplayCount(actionSlot, 9999)
-                    self.stackText:SetText(displayCount)
-                    self.stackText:Show()
+            -- Find the soonest-expiring timer (next recharge)
+            local firstTimer = nil
+            for _, entry in ipairs(state.cooldownTimers) do
+                if not firstTimer or entry.endTime < firstTimer.endTime then
+                    firstTimer = entry
+                end
+            end
+
+            local fullyCharged = state.cooldownStacks >= maxStacks
+            local depleted     = state.cooldownStacks == 0
+
+            if fullyCharged then
+                -- All stacks available: show only if alwaysShow
+                if cd.alwaysShow and (cd.spellId or 0) > 0 then
+                    if self.icon then self.icon:SetDesaturated(false) end
+                    if self.cooldown then self.cooldown:SetCooldown(0,0); self.cooldown:Hide() end
+                    self.timerText:SetText(""); self.timerText:Hide()
+                    if elem.showStacks and maxStacks > 1 then
+                        self.stackText:SetText(tostring(state.cooldownStacks)); self.stackText:Show()
+                    else
+                        self.stackText:SetText(""); self.stackText:Hide()
+                    end
+                    self:SetAlpha(elem.iconAlpha or 1); self:Show()
                 else
-                    local count = GetActionCount(actionSlot)
-                    if count and count > 0 then
-                        self.stackText:SetText(count)
-                        self.stackText:Show()
-                    else
-                        self.stackText:Hide()
-                    end
+                    self:Hide()
                 end
 
-                -- Usability (vertex color)
-                pcall(function()
-                    local isUsable, notEnoughMana = IsUsableAction(actionSlot)
-                    if isUsable then
-                        self.icon:SetVertexColor(1, 1, 1)
-                    elseif notEnoughMana then
-                        self.icon:SetVertexColor(0.5, 0.5, 1)
+            elseif depleted then
+                -- No stacks left — grey icon, sweep, countdown
+                if self.icon then self.icon:SetDesaturated(true) end
+                if self.cooldown then
+                    if firstTimer then
+                        self.cooldown:SetCooldown(firstTimer.start, firstTimer.endTime - firstTimer.start)
+                        self.cooldown:Show()
                     else
-                        self.icon:SetVertexColor(0.4, 0.4, 0.4)
+                        self.cooldown:SetCooldown(0,0); self.cooldown:Hide()
                     end
-                end)
-
-                -- Range check
-                pcall(function()
-                    local inRange = IsActionInRange(actionSlot)
-                    if inRange == false then
-                        self.icon:SetVertexColor(1, 0, 0)
+                end
+                if elem.showTimer and firstTimer then
+                    local remaining = firstTimer.endTime - now
+                    if remaining > 0 then
+                        self.timerText:SetText(string.format("%.1f", remaining)); self.timerText:Show()
+                    else
+                        self.timerText:SetText(""); self.timerText:Hide()
                     end
-                end)
+                else
+                    self.timerText:SetText(""); self.timerText:Hide()
+                end
+                self.stackText:SetText(""); self.stackText:Hide()
+                self:SetAlpha(elem.iconAlpha or 1); self:Show()
 
-                self.icon:SetDesaturated(false)
-                self:SetAlpha(elem.iconAlpha or 1)
-                self:Show()
-                self.timerText:Hide()
-                -- Glow managed by SPELL_ACTIVATION_OVERLAY events
+            else
+                -- Partially depleted: stacks > 0 but timers running.
+                -- Icon stays solid/colored. Show remaining stack count + timer until next recharge.
+                if self.icon then self.icon:SetDesaturated(false) end
+                if self.cooldown then self.cooldown:SetCooldown(0,0); self.cooldown:Hide() end
+                if elem.showTimer and firstTimer then
+                    local remaining = firstTimer.endTime - now
+                    if remaining > 0 then
+                        self.timerText:SetText(string.format("%.1f", remaining)); self.timerText:Show()
+                    else
+                        self.timerText:SetText(""); self.timerText:Hide()
+                    end
+                else
+                    self.timerText:SetText(""); self.timerText:Hide()
+                end
+                if elem.showStacks and maxStacks > 1 then
+                    self.stackText:SetText(tostring(state.cooldownStacks)); self.stackText:Show()
+                else
+                    self.stackText:SetText(""); self.stackText:Hide()
+                end
+                self:SetAlpha(elem.iconAlpha or 1); self:Show()
             end
         end
     end)
@@ -974,13 +1025,15 @@ local function UpdateIconDisplay(element, state, f)
 
     -- Update texture
     local texturePath
-    if element.iconSpellId and element.iconSpellId > 0 then
+    if element.triggerType == "cooldown" and element.cooldown and (element.cooldown.spellId or 0) > 0 then
+        texturePath = C_Spell and C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(element.cooldown.spellId)
+    elseif element.iconSpellId and element.iconSpellId > 0 then
         texturePath = C_Spell and C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(element.iconSpellId)
     end
     if not texturePath and element.iconTexture then
         texturePath = element.iconTexture
     end
-    if texturePath then
+    if texturePath and f.icon then
         f.icon:SetTexture(texturePath)
     end
 
@@ -1045,18 +1098,28 @@ local function UpdateIconDisplay(element, state, f)
         else
             f:Hide()
         end
-    elseif element.triggerType == "spelldata" then
-        -- Action bar style: always visible, OnUpdate handles all data
-        f.icon:SetDesaturated(false)
-        f:SetAlpha(element.iconAlpha or 1)
-        f:Show()
-        -- Show/hide glow based on overlay state (set by SPELL_ACTIVATION events)
-        if state.overlayActive then
-            ShowGlowEffect(f, element.glowStyle or "glow")
+    elseif element.triggerType == "cooldown" then
+        local cd = element.cooldown
+        local maxStacks = cd and (cd.stacks and cd.stacks > 0) and cd.stacks or 1
+        local curStacks = state.cooldownStacks or maxStacks
+        local fullyCharged = curStacks >= maxStacks
+        local depleted     = curStacks == 0
+        if f.cooldown then f.cooldown:SetCooldown(0,0); f.cooldown:Hide() end
+        if depleted then
+            if f.icon then f.icon:SetDesaturated(true) end
+            f:SetAlpha(element.iconAlpha or 1); f:Show()
+        elseif fullyCharged then
+            if cd and cd.alwaysShow and (cd.spellId or 0) > 0 then
+                if f.icon then f.icon:SetDesaturated(false) end
+                f:SetAlpha(element.iconAlpha or 1); f:Show()
+            else
+                f:Hide()
+            end
         else
-            HideGlowEffect(f)
+            -- Partially depleted — stays solid/visible always
+            if f.icon then f.icon:SetDesaturated(false) end
+            f:SetAlpha(element.iconAlpha or 1); f:Show()
         end
-        if f.cooldown then f.cooldown:Show() end
     end
 
     -- Lock state
@@ -1150,11 +1213,9 @@ local function CreateBarDisplay(element)
         local elem = FindElementById(self.elementId)
         if not elem then return end
 
-        -- Update aura/spelldata
+        -- Update aura on each frame
         if elem.triggerType == "aura" then
             UpdateAuraElement(elem, state)
-        elseif elem.triggerType == "spelldata" then
-            UpdateSpellDataElement(elem, state)
         end
 
         -- Bar value and timer
@@ -1317,6 +1378,18 @@ DestroyDisplay = function(element)
 end
 
 RefreshAllDisplays = function()
+    if InCombatLockdown() then
+        -- Defer until out of combat
+        local frame = CreateFrame("Frame")
+        frame:RegisterEvent("PLAYER_REGEN_ENABLED")
+        frame:SetScript("OnEvent", function(self)
+            self:UnregisterAllEvents()
+            self:SetScript("OnEvent", nil)
+            RefreshAllDisplays()
+        end)
+        return
+    end
+
     -- Destroy all existing displays
     for id, f in pairs(displayFrames) do
         f:Hide()
@@ -1438,7 +1511,9 @@ UpdateGroupLayout = function(group)
         local df = displayFrames[element.id]
         if df then
             df:ClearAllPoints()
-            df:SetParent(container)
+            if not InCombatLockdown() then
+                df:SetParent(container)
+            end
 
             local w = df:GetWidth()
             local h = df:GetHeight()
@@ -1468,27 +1543,16 @@ RegisterDynamicEvents = function()
     -- Unregister dynamic events first
     pcall(function() eventFrame:UnregisterEvent("UNIT_SPELLCAST_SUCCEEDED") end)
     pcall(function() eventFrame:UnregisterEvent("UNIT_AURA") end)
-    pcall(function() eventFrame:UnregisterEvent("SPELL_UPDATE_COOLDOWN") end)
-    pcall(function() eventFrame:UnregisterEvent("SPELL_UPDATE_CHARGES") end)
-    pcall(function() eventFrame:UnregisterEvent("SPELL_ACTIVATION_OVERLAY_GLOW_SHOW") end)
-    pcall(function() eventFrame:UnregisterEvent("SPELL_ACTIVATION_OVERLAY_GLOW_HIDE") end)
-    pcall(function() eventFrame:UnregisterEvent("ACTIONBAR_SLOT_CHANGED") end)
-    pcall(function() eventFrame:UnregisterEvent("ACTIONBAR_UPDATE_STATE") end)
-    pcall(function() eventFrame:UnregisterEvent("ACTIONBAR_UPDATE_USABLE") end)
-    pcall(function() eventFrame:UnregisterEvent("ACTIONBAR_UPDATE_COOLDOWN") end)
 
     local needSpellcast = false
     local needAura = false
-    local needSpelldata = false
 
     for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
         if element.enabled then
-            if element.triggerType == "spellcast" then
+            if element.triggerType == "spellcast" or element.triggerType == "cooldown" then
                 needSpellcast = true
             elseif element.triggerType == "aura" then
                 needAura = true
-            elseif element.triggerType == "spelldata" then
-                needSpelldata = true
             end
         end
     end
@@ -1498,16 +1562,6 @@ RegisterDynamicEvents = function()
     end
     if needAura then
         eventFrame:RegisterUnitEvent("UNIT_AURA", "player")
-    end
-    if needSpelldata then
-        eventFrame:RegisterEvent("SPELL_UPDATE_COOLDOWN")
-        eventFrame:RegisterEvent("SPELL_UPDATE_CHARGES")
-        eventFrame:RegisterEvent("SPELL_ACTIVATION_OVERLAY_GLOW_SHOW")
-        eventFrame:RegisterEvent("SPELL_ACTIVATION_OVERLAY_GLOW_HIDE")
-        eventFrame:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
-        eventFrame:RegisterEvent("ACTIONBAR_UPDATE_STATE")
-        eventFrame:RegisterEvent("ACTIONBAR_UPDATE_USABLE")
-        eventFrame:RegisterEvent("ACTIONBAR_UPDATE_COOLDOWN")
     end
 end
 
@@ -1560,7 +1614,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             -- Merge sub-tables
             if not element.spellcast then element.spellcast = DeepCopy(DEFAULT_ELEMENT.spellcast) end
             if not element.aura then element.aura = DeepCopy(DEFAULT_ELEMENT.aura) end
-            if not element.spelldata then element.spelldata = DeepCopy(DEFAULT_ELEMENT.spelldata) end
+            if not element.cooldown then element.cooldown = DeepCopy(DEFAULT_ELEMENT.cooldown) end
             if not element.loadConditions then element.loadConditions = DeepCopy(DEFAULT_ELEMENT.loadConditions) end
         end
 
@@ -1605,59 +1659,30 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             end
         end
 
-    elseif event == "SPELL_UPDATE_COOLDOWN" or event == "SPELL_UPDATE_CHARGES" then
-        for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
-            if element.triggerType == "spelldata" and ShouldLoad(element) then
-                local state = GetElementState(element.id)
-                if state then
-                    UpdateSpellDataElement(element, state)
-                    UpdateDisplay(element)
-                end
-            end
-        end
-
-    elseif event == "SPELL_ACTIVATION_OVERLAY_GLOW_SHOW" then
-        local spellID = ...
-        for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
-            if element.triggerType == "spelldata" and ShouldLoad(element) then
-                local state = GetElementState(element.id)
-                if state and state.actionSpellId == spellID then
-                    state.overlayActive = true
-                    local f = displayFrames[element.id]
-                    if f then ShowGlowEffect(f, element.glowStyle or "glow") end
-                end
-            end
-        end
-
-    elseif event == "SPELL_ACTIVATION_OVERLAY_GLOW_HIDE" then
-        local spellID = ...
-        for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
-            if element.triggerType == "spelldata" and ShouldLoad(element) then
-                local state = GetElementState(element.id)
-                if state and state.actionSpellId == spellID then
-                    state.overlayActive = false
-                    local f = displayFrames[element.id]
-                    if f then HideGlowEffect(f) end
-                end
-            end
-        end
-
-    elseif event == "ACTIONBAR_SLOT_CHANGED" or event == "ACTIONBAR_UPDATE_STATE" or
-           event == "ACTIONBAR_UPDATE_USABLE" or event == "ACTIONBAR_UPDATE_COOLDOWN" then
-        for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
-            if element.triggerType == "spelldata" and ShouldLoad(element) then
-                local state = GetElementState(element.id)
-                if state then
-                    UpdateSpellDataElement(element, state)
-                end
-                UpdateDisplay(element)
-            end
-        end
-
     elseif event == "PLAYER_SPECIALIZATION_CHANGED" or event == "SPELLS_CHANGED" then
         C_Timer.After(0.5, RefreshAllDisplays)
 
     elseif event == "PLAYER_REGEN_ENABLED" or event == "PLAYER_REGEN_DISABLED" then
+        -- On leaving combat, apply any leaveCombat clear rules
+        if event == "PLAYER_REGEN_ENABLED" then
+            for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
+                if element.enabled and element.triggerType == "spellcast" and element.spellcast then
+                    for _, rule in ipairs(element.spellcast.clearRules) do
+                        if rule.type == "leaveCombat" then
+                            local state = elementStates[element.id]
+                            if state then
+                                state.stacks = 0
+                                state.expirationTime = 0
+                                state.duration = 0
+                                state.active = false
+                                UpdateDisplay(element)
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+        end
         -- Combat state changed — re-check load conditions
         for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
             if element.loadConditions and element.loadConditions.inCombat ~= nil then
@@ -2255,18 +2280,39 @@ local function CreateConfigWindow()
     configFrame.placeholder:SetText("Select an element from the list\nor click +Add to create one")
 
     ---------------------------------------------------------------------------
-    -- Bottom bar — Lock, Import, Export
+    -- Bottom bar — Lock, Unlock, Import, Export
     ---------------------------------------------------------------------------
     local lockBtn = CreateFrame("Button", nil, configFrame, "UIPanelButtonTemplate")
-    lockBtn:SetSize(80, 22)
+    lockBtn:SetSize(70, 22)
     lockBtn:SetPoint("BOTTOMLEFT", 12, 12)
-    lockBtn:SetText(JarsEasyTrackerCharDB.locked and "Unlock" or "Lock")
+    lockBtn:SetText("Lock")
     configFrame.lockBtn = lockBtn
 
-    lockBtn:SetScript("OnClick", function(self)
-        JarsEasyTrackerCharDB.locked = not JarsEasyTrackerCharDB.locked
-        self:SetText(JarsEasyTrackerCharDB.locked and "Unlock" or "Lock")
-        -- Update all display frames
+    lockBtn:SetScript("OnClick", function()
+        JarsEasyTrackerCharDB.locked = true
+        -- Clear all per-frame manualUnlock flags so lock takes full effect
+        for _, f in pairs(displayFrames) do
+            f.manualUnlock = false
+        end
+        for _, f in pairs(groupFrames) do
+            f.manualUnlock = false
+        end
+        for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
+            UpdateDisplay(element)
+        end
+        for _, group in ipairs(JarsEasyTrackerCharDB.groups) do
+            UpdateGroupLayout(group)
+        end
+    end)
+
+    local unlockBtn = CreateFrame("Button", nil, configFrame, "UIPanelButtonTemplate")
+    unlockBtn:SetSize(70, 22)
+    unlockBtn:SetPoint("LEFT", lockBtn, "RIGHT", 4, 0)
+    unlockBtn:SetText("Unlock")
+    configFrame.unlockBtn = unlockBtn
+
+    unlockBtn:SetScript("OnClick", function()
+        JarsEasyTrackerCharDB.locked = false
         for _, element in ipairs(JarsEasyTrackerCharDB.elements) do
             UpdateDisplay(element)
         end
@@ -2278,7 +2324,7 @@ local function CreateConfigWindow()
     -- Export button
     local exportBtn = CreateFrame("Button", nil, configFrame, "UIPanelButtonTemplate")
     exportBtn:SetSize(80, 22)
-    exportBtn:SetPoint("LEFT", lockBtn, "RIGHT", 8, 0)
+    exportBtn:SetPoint("LEFT", unlockBtn, "RIGHT", 8, 0)
     exportBtn:SetText("Export")
 
     exportBtn:SetScript("OnClick", function()
@@ -3205,7 +3251,7 @@ local function CreateConfigWindow()
         local triggerLabels = {
             spellcast = "Spell Cast",
             aura = "Aura (Buff/Debuff)",
-            spelldata = "Spell Data (Action Bar)",
+            cooldown = "Cooldown Tracker",
         }
         triggerDropdown:SetDefaultText(triggerLabels[element.triggerType] or "Spell Cast")
         triggerDropdown:SetupMenu(function(_, rootDescription)
@@ -3288,46 +3334,62 @@ local function CreateConfigWindow()
             yOff = yOff - 20
 
             for ruleIdx, rule in ipairs(element.spellcast.clearRules) do
-                Label("Spell ID:", leftMargin + 10)
-                local clearSpellBox = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
-                clearSpellBox:SetPoint("TOPLEFT", leftMargin + 75, yOff + 3)
-                clearSpellBox:SetSize(80, 20)
-                clearSpellBox:SetAutoFocus(false)
-                clearSpellBox:SetText(tostring(rule.spellId or 0))
-                clearSpellBox:SetScript("OnEnterPressed", function(self)
-                    rule.spellId = tonumber(self:GetText()) or 0
-                    self:ClearFocus()
-                end)
-                clearSpellBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+                if rule.type == "leaveCombat" then
+                    -- Leave-combat clear rule (no spell ID needed)
+                    local lcLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    lcLabel:SetPoint("TOPLEFT", leftMargin + 10, yOff)
+                    lcLabel:SetText("|cffffff00Leaves Combat|r")
 
-                -- Search button for clear rule spell ID
-                SpellSearchButton(clearSpellBox, function(spellId)
-                    rule.spellId = spellId
-                end)
+                    local removeLCBtn = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
+                    removeLCBtn:SetSize(20, 20)
+                    removeLCBtn:SetPoint("LEFT", lcLabel, "RIGHT", 8, 0)
+                    removeLCBtn:SetText("X")
+                    removeLCBtn:SetScript("OnClick", function()
+                        table.remove(element.spellcast.clearRules, ruleIdx)
+                        PopulateRightPanel(element)
+                    end)
+                else
+                    Label("Spell ID:", leftMargin + 10)
+                    local clearSpellBox = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
+                    clearSpellBox:SetPoint("TOPLEFT", leftMargin + 75, yOff + 3)
+                    clearSpellBox:SetSize(80, 20)
+                    clearSpellBox:SetAutoFocus(false)
+                    clearSpellBox:SetText(tostring(rule.spellId or 0))
+                    clearSpellBox:SetScript("OnEnterPressed", function(self)
+                        rule.spellId = tonumber(self:GetText()) or 0
+                        self:ClearFocus()
+                    end)
+                    clearSpellBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 
-                local clearStacksLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                clearStacksLabel:SetPoint("TOPLEFT", leftMargin + 190, yOff)
-                clearStacksLabel:SetText("Stacks:")
+                    -- Search button for clear rule spell ID
+                    SpellSearchButton(clearSpellBox, function(spellId)
+                        rule.spellId = spellId
+                    end)
 
-                local clearStacksBox = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
-                clearStacksBox:SetPoint("LEFT", clearStacksLabel, "RIGHT", 5, 0)
-                clearStacksBox:SetSize(40, 20)
-                clearStacksBox:SetAutoFocus(false)
-                clearStacksBox:SetText(tostring(rule.stacks or 0))
-                clearStacksBox:SetScript("OnEnterPressed", function(self)
-                    rule.stacks = tonumber(self:GetText()) or 0
-                    self:ClearFocus()
-                end)
-                clearStacksBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+                    local clearStacksLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    clearStacksLabel:SetPoint("TOPLEFT", leftMargin + 190, yOff)
+                    clearStacksLabel:SetText("Stacks:")
 
-                local removeClearBtn = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
-                removeClearBtn:SetSize(20, 20)
-                removeClearBtn:SetPoint("LEFT", clearStacksBox, "RIGHT", 5, 0)
-                removeClearBtn:SetText("X")
-                removeClearBtn:SetScript("OnClick", function()
-                    table.remove(element.spellcast.clearRules, ruleIdx)
-                    PopulateRightPanel(element)
-                end)
+                    local clearStacksBox = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
+                    clearStacksBox:SetPoint("LEFT", clearStacksLabel, "RIGHT", 5, 0)
+                    clearStacksBox:SetSize(40, 20)
+                    clearStacksBox:SetAutoFocus(false)
+                    clearStacksBox:SetText(tostring(rule.stacks or 0))
+                    clearStacksBox:SetScript("OnEnterPressed", function(self)
+                        rule.stacks = tonumber(self:GetText()) or 0
+                        self:ClearFocus()
+                    end)
+                    clearStacksBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+
+                    local removeClearBtn = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
+                    removeClearBtn:SetSize(20, 20)
+                    removeClearBtn:SetPoint("LEFT", clearStacksBox, "RIGHT", 5, 0)
+                    removeClearBtn:SetText("X")
+                    removeClearBtn:SetScript("OnClick", function()
+                        table.remove(element.spellcast.clearRules, ruleIdx)
+                        PopulateRightPanel(element)
+                    end)
+                end
 
                 yOff = yOff - 28
             end
@@ -3338,6 +3400,19 @@ local function CreateConfigWindow()
             addClearBtn:SetText("+ Rule")
             addClearBtn:SetScript("OnClick", function()
                 table.insert(element.spellcast.clearRules, { spellId = 0, stacks = 0 })
+                PopulateRightPanel(element)
+            end)
+
+            local addLeaveCombatBtn = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
+            addLeaveCombatBtn:SetSize(110, 20)
+            addLeaveCombatBtn:SetPoint("LEFT", addClearBtn, "RIGHT", 6, 0)
+            addLeaveCombatBtn:SetText("+ Leave Combat")
+            addLeaveCombatBtn:SetScript("OnClick", function()
+                -- Only allow one leave-combat rule at a time
+                for _, r in ipairs(element.spellcast.clearRules) do
+                    if r.type == "leaveCombat" then return end
+                end
+                table.insert(element.spellcast.clearRules, { type = "leaveCombat" })
                 PopulateRightPanel(element)
             end)
             yOff = yOff - 30
@@ -3432,42 +3507,112 @@ local function CreateConfigWindow()
             end)
             yOff = yOff - 30
 
-        elseif element.triggerType == "spelldata" then
-            -- Action Slot
-            Label("Action Slot:", leftMargin)
-            local slotBox = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
-            slotBox:SetPoint("TOPLEFT", leftMargin + 80, yOff + 3)
-            slotBox:SetSize(80, 20)
-            slotBox:SetAutoFocus(false)
-            slotBox:SetText(tostring(element.spelldata.actionSlot or 0))
-            slotBox:SetScript("OnEnterPressed", function(self)
-                element.spelldata.actionSlot = tonumber(self:GetText()) or 0
+        elseif element.triggerType == "cooldown" then
+            -- Spell ID (used as both trigger and icon source)
+            Label("Spell ID:", leftMargin)
+            local cdSpellBox = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
+            cdSpellBox:SetPoint("TOPLEFT", leftMargin + 80, yOff + 3)
+            cdSpellBox:SetSize(100, 20)
+            cdSpellBox:SetAutoFocus(false)
+            cdSpellBox:SetText(tostring(element.cooldown.spellId or 0))
+            cdSpellBox:SetScript("OnEnterPressed", function(self)
+                element.cooldown.spellId = tonumber(self:GetText()) or 0
                 self:ClearFocus()
                 ApplyChanges()
-                PopulateRightPanel(element)
             end)
-            slotBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-
-            -- Show the action info for context
-            if element.spelldata.actionSlot and element.spelldata.actionSlot > 0 then
-                pcall(function()
-                    if HasAction(element.spelldata.actionSlot) then
-                        local actionType, id = GetActionInfo(element.spelldata.actionSlot)
-                        local name = (actionType == "spell" and C_Spell and C_Spell.GetSpellName) and C_Spell.GetSpellName(id) or "Unknown"
-                        local infoLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                        infoLabel:SetPoint("LEFT", slotBox, "RIGHT", 8, 0)
-                        infoLabel:SetText("|cff88ff88" .. (name or "?") .. "|r")
-                    end
-                end)
+            cdSpellBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+            SpellSearchButton(cdSpellBox, function(spellId)
+                element.cooldown.spellId = spellId
+                ApplyChanges()
+            end)
+            -- Show spell name for context
+            if (element.cooldown.spellId or 0) > 0 then
+                local spellName = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(element.cooldown.spellId)
+                if spellName then
+                    local cdNameLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    cdNameLabel:SetPoint("LEFT", cdSpellBox, "RIGHT", 8, 0)
+                    cdNameLabel:SetText("|cff88ff88" .. spellName .. "|r")
+                end
             end
             yOff = yOff - 28
 
-            -- Slot reference
-            local refLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            refLabel:SetPoint("TOPLEFT", leftMargin + 10, yOff)
-            refLabel:SetTextColor(0.5, 0.5, 0.5)
-            refLabel:SetText("Bar1: 1-12 | Bar2: 13-24 | Bar3: 25-36 | Bar4: 37-48 | Bar5: 49-60 | Bar6: 61-72")
-            yOff = yOff - 18
+            -- Cooldown value (seconds)
+            Label("Cooldown (sec):", leftMargin)
+            local cdValueBox = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
+            cdValueBox:SetPoint("TOPLEFT", leftMargin + 115, yOff + 3)
+            cdValueBox:SetSize(70, 20)
+            cdValueBox:SetAutoFocus(false)
+            cdValueBox:SetText(tostring(element.cooldown.cooldown or 0))
+            cdValueBox:SetScript("OnEnterPressed", function(self)
+                element.cooldown.cooldown = tonumber(self:GetText()) or 0
+                self:ClearFocus()
+            end)
+            cdValueBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+            yOff = yOff - 28
+
+            -- Stacks (0 = single charge)
+            Label("Stacks (0=single):", leftMargin)
+            local cdStacksBox = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
+            cdStacksBox:SetPoint("TOPLEFT", leftMargin + 130, yOff + 3)
+            cdStacksBox:SetSize(50, 20)
+            cdStacksBox:SetAutoFocus(false)
+            cdStacksBox:SetText(tostring(element.cooldown.stacks or 0))
+            cdStacksBox:SetScript("OnEnterPressed", function(self)
+                element.cooldown.stacks = tonumber(self:GetText()) or 0
+                self:ClearFocus()
+                ApplyChanges()
+            end)
+            cdStacksBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+            yOff = yOff - 28
+
+            -- Reset Spell ID
+            Label("Reset Spell ID:", leftMargin)
+            local cdResetBox = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
+            cdResetBox:SetPoint("TOPLEFT", leftMargin + 105, yOff + 3)
+            cdResetBox:SetSize(90, 20)
+            cdResetBox:SetAutoFocus(false)
+            cdResetBox:SetText(tostring(element.cooldown.resetId or 0))
+            cdResetBox:SetScript("OnEnterPressed", function(self)
+                element.cooldown.resetId = tonumber(self:GetText()) or 0
+                self:ClearFocus()
+            end)
+            cdResetBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+            SpellSearchButton(cdResetBox, function(spellId)
+                element.cooldown.resetId = spellId
+            end)
+            if (element.cooldown.resetId or 0) > 0 then
+                local resetName = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(element.cooldown.resetId)
+                if resetName then
+                    local cdResetNameLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    cdResetNameLabel:SetPoint("LEFT", cdResetBox, "RIGHT", 8, 0)
+                    cdResetNameLabel:SetText("|cffff8888" .. resetName .. "|r")
+                end
+            end
+            yOff = yOff - 28
+
+            -- Haste checkbox
+            local cdHasteCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+            cdHasteCheck:SetPoint("TOPLEFT", leftMargin, yOff)
+            cdHasteCheck:SetChecked(element.cooldown.haste)
+            cdHasteCheck.text = cdHasteCheck:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            cdHasteCheck.text:SetPoint("LEFT", cdHasteCheck, "RIGHT", 2, 0)
+            cdHasteCheck.text:SetText("Reduce by Haste %")
+            cdHasteCheck:SetScript("OnClick", function(self)
+                element.cooldown.haste = self:GetChecked()
+            end)
+
+            -- Always Show checkbox
+            local cdAlwaysCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+            cdAlwaysCheck:SetPoint("LEFT", cdHasteCheck.text, "RIGHT", 20, 0)
+            cdAlwaysCheck:SetChecked(element.cooldown.alwaysShow)
+            cdAlwaysCheck.text = cdAlwaysCheck:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            cdAlwaysCheck.text:SetPoint("LEFT", cdAlwaysCheck, "RIGHT", 2, 0)
+            cdAlwaysCheck.text:SetText("Always Show (even off CD)")
+            cdAlwaysCheck:SetScript("OnClick", function(self)
+                element.cooldown.alwaysShow = self:GetChecked()
+                ApplyChanges()
+            end)
+            yOff = yOff - 30
         end
 
         -----------------------------------------------------------------------
@@ -3476,8 +3621,8 @@ local function CreateConfigWindow()
         if element.elementType == "icon" then
             SectionHeader("Display (Icon)")
 
-            -- Spell ID for icon texture (not needed for spelldata — texture comes from action slot)
-            if element.triggerType ~= "spelldata" then
+            -- Spell ID for icon texture (not used for cooldown — icon comes from cooldown.spellId)
+            if element.triggerType ~= "cooldown" then
                 Label("Icon Spell ID:", leftMargin)
                 local iconSpellBox = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
                 iconSpellBox:SetPoint("TOPLEFT", leftMargin + 100, yOff + 3)
@@ -3532,34 +3677,33 @@ local function CreateConfigWindow()
             end)
             yOff = yOff - 45
 
-            -- These options only apply to non-spelldata triggers
-            if element.triggerType ~= "spelldata" then
-                -- Show stacks checkbox
-                local stackCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-                stackCheck:SetPoint("TOPLEFT", leftMargin, yOff)
-                stackCheck:SetChecked(element.showStacks)
-                stackCheck.text = stackCheck:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                stackCheck.text:SetPoint("LEFT", stackCheck, "RIGHT", 2, 0)
-                stackCheck.text:SetText("Show Stacks")
-                stackCheck:SetScript("OnClick", function(self)
-                    element.showStacks = self:GetChecked()
-                    ApplyChanges()
-                end)
+            -- Show stacks checkbox
+            local stackCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+            stackCheck:SetPoint("TOPLEFT", leftMargin, yOff)
+            stackCheck:SetChecked(element.showStacks)
+            stackCheck.text = stackCheck:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            stackCheck.text:SetPoint("LEFT", stackCheck, "RIGHT", 2, 0)
+            stackCheck.text:SetText("Show Stacks")
+            stackCheck:SetScript("OnClick", function(self)
+                element.showStacks = self:GetChecked()
+                ApplyChanges()
+            end)
 
-                -- Show timer checkbox
-                local timerCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-                timerCheck:SetPoint("LEFT", stackCheck.text, "RIGHT", 20, 0)
-                timerCheck:SetChecked(element.showTimer)
-                timerCheck.text = timerCheck:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                timerCheck.text:SetPoint("LEFT", timerCheck, "RIGHT", 2, 0)
-                timerCheck.text:SetText("Show Timer")
-                timerCheck:SetScript("OnClick", function(self)
-                    element.showTimer = self:GetChecked()
-                    ApplyChanges()
-                end)
-                yOff = yOff - 30
+            -- Show timer checkbox
+            local timerCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+            timerCheck:SetPoint("LEFT", stackCheck.text, "RIGHT", 20, 0)
+            timerCheck:SetChecked(element.showTimer)
+            timerCheck.text = timerCheck:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            timerCheck.text:SetPoint("LEFT", timerCheck, "RIGHT", 2, 0)
+            timerCheck.text:SetText("Show Timer")
+            timerCheck:SetScript("OnClick", function(self)
+                element.showTimer = self:GetChecked()
+                ApplyChanges()
+            end)
+            yOff = yOff - 30
 
-                -- Desaturate inactive
+            -- Desaturate inactive (not applicable to cooldown — desaturation is automatic)
+            if element.triggerType ~= "cooldown" then
                 local desatCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
                 desatCheck:SetPoint("TOPLEFT", leftMargin, yOff)
                 desatCheck:SetChecked(element.desaturateInactive)
@@ -3573,9 +3717,8 @@ local function CreateConfigWindow()
                 yOff = yOff - 30
             end
 
-            -- Stack/Charges font size (always shown)
-            local fontLabel = element.triggerType == "spelldata" and "Font:" or "Stack Font:"
-            Label(fontLabel, leftMargin)
+            -- Stack font size
+            Label("Stack Font:", leftMargin)
             local stackFontSlider = CreateFrame("Slider", nil, parent, "OptionsSliderTemplate")
             stackFontSlider:SetPoint("TOPLEFT", leftMargin + 80, yOff - 8)
             stackFontSlider:SetWidth(150)
@@ -3593,61 +3736,57 @@ local function CreateConfigWindow()
             end)
             yOff = yOff - 45
 
-            -- Timer font size (only for non-spelldata)
-            if element.triggerType ~= "spelldata" then
-                Label("Timer Font:", leftMargin)
-                local timerFontSlider = CreateFrame("Slider", nil, parent, "OptionsSliderTemplate")
-                timerFontSlider:SetPoint("TOPLEFT", leftMargin + 80, yOff - 8)
-                timerFontSlider:SetWidth(150)
-                timerFontSlider:SetMinMaxValues(8, 32)
-                timerFontSlider:SetValue(element.timerFontSize)
-                timerFontSlider:SetValueStep(2)
-                timerFontSlider:SetObeyStepOnDrag(true)
-                timerFontSlider.Text:SetText(tostring(element.timerFontSize))
-                timerFontSlider.Low:SetText("")
-                timerFontSlider.High:SetText("")
-                timerFontSlider:SetScript("OnValueChanged", function(self, value)
-                    element.timerFontSize = math.floor(value)
-                    self.Text:SetText(tostring(element.timerFontSize))
-                    ApplyChanges()
-                end)
-                yOff = yOff - 45
-            end
+            -- Timer font size
+            Label("Timer Font:", leftMargin)
+            local timerFontSlider = CreateFrame("Slider", nil, parent, "OptionsSliderTemplate")
+            timerFontSlider:SetPoint("TOPLEFT", leftMargin + 80, yOff - 8)
+            timerFontSlider:SetWidth(150)
+            timerFontSlider:SetMinMaxValues(8, 32)
+            timerFontSlider:SetValue(element.timerFontSize)
+            timerFontSlider:SetValueStep(2)
+            timerFontSlider:SetObeyStepOnDrag(true)
+            timerFontSlider.Text:SetText(tostring(element.timerFontSize))
+            timerFontSlider.Low:SetText("")
+            timerFontSlider.High:SetText("")
+            timerFontSlider:SetScript("OnValueChanged", function(self, value)
+                element.timerFontSize = math.floor(value)
+                self.Text:SetText(tostring(element.timerFontSize))
+                ApplyChanges()
+            end)
+            yOff = yOff - 45
 
-            -- Show glow checkbox (label varies by trigger type) — not for spelldata
-            if element.triggerType ~= "spelldata" then
-                local glowCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-                glowCheck:SetPoint("TOPLEFT", leftMargin, yOff)
-                glowCheck:SetChecked(element.showGlow)
-                glowCheck.text = glowCheck:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                glowCheck.text:SetPoint("LEFT", glowCheck, "RIGHT", 2, 0)
-                local glowLabel = "Show Glow When Active"
-                if element.triggerType == "spellcast" then
-                    glowLabel = "Glow at Max Stacks"
+            -- Show glow checkbox
+            local glowCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+            glowCheck:SetPoint("TOPLEFT", leftMargin, yOff)
+            glowCheck:SetChecked(element.showGlow)
+            glowCheck.text = glowCheck:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            glowCheck.text:SetPoint("LEFT", glowCheck, "RIGHT", 2, 0)
+            local glowLabel = "Show Glow When Active"
+            if element.triggerType == "spellcast" then
+                glowLabel = "Glow at Max Stacks"
+            end
+            glowCheck.text:SetText(glowLabel)
+            glowCheck:SetScript("OnClick", function(self)
+                element.showGlow = self:GetChecked()
+                ApplyChanges()
+            end)
+            yOff = yOff - 30
+
+            -- Glow style dropdown
+            Label("Glow Style:", leftMargin)
+            local glowStyleDropdown = CreateFrame("DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
+            glowStyleDropdown:SetPoint("TOPLEFT", leftMargin + 80, yOff + 5)
+            glowStyleDropdown:SetWidth(150)
+            glowStyleDropdown:SetDefaultText(FindGlowStyle(element.glowStyle or "glow").label)
+            glowStyleDropdown:SetupMenu(function(dropdown, rootDescription)
+                for _, style in ipairs(GLOW_STYLES) do
+                    rootDescription:CreateButton(style.label, function()
+                        element.glowStyle = style.key
+                        ApplyChanges()
+                    end)
                 end
-                glowCheck.text:SetText(glowLabel)
-                glowCheck:SetScript("OnClick", function(self)
-                    element.showGlow = self:GetChecked()
-                    ApplyChanges()
-                end)
-                yOff = yOff - 30
-
-                -- Glow style dropdown
-                Label("Glow Style:", leftMargin)
-                local glowStyleDropdown = CreateFrame("DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
-                glowStyleDropdown:SetPoint("TOPLEFT", leftMargin + 80, yOff + 5)
-                glowStyleDropdown:SetWidth(150)
-                glowStyleDropdown:SetDefaultText(FindGlowStyle(element.glowStyle or "glow").label)
-                glowStyleDropdown:SetupMenu(function(dropdown, rootDescription)
-                    for _, style in ipairs(GLOW_STYLES) do
-                        rootDescription:CreateButton(style.label, function()
-                            element.glowStyle = style.key
-                            ApplyChanges()
-                        end)
-                    end
-                end)
-                yOff = yOff - 38
-            end
+            end)
+            yOff = yOff - 38
 
             -- Opacity slider
             Label("Opacity:", leftMargin)
@@ -3669,9 +3808,8 @@ local function CreateConfigWindow()
             end)
             yOff = yOff - 45
 
-            -- Stack/Charges text position dropdown
-            local posLabel = element.triggerType == "spelldata" and "Charges Pos:" or "Stack Pos:"
-            Label(posLabel, leftMargin)
+            -- Stack text position dropdown
+            Label("Stack Pos:", leftMargin)
             local stackPosDropdown = CreateFrame("DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
             stackPosDropdown:SetPoint("TOPLEFT", leftMargin + 80, yOff + 5)
             stackPosDropdown:SetWidth(150)
@@ -3689,26 +3827,24 @@ local function CreateConfigWindow()
             end)
             yOff = yOff - 35
 
-            -- Timer text position dropdown (only for non-spelldata)
-            if element.triggerType ~= "spelldata" then
-                Label("Timer Pos:", leftMargin)
-                local timerPosDropdown = CreateFrame("DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
-                timerPosDropdown:SetPoint("TOPLEFT", leftMargin + 80, yOff + 5)
-                timerPosDropdown:SetWidth(150)
-                local curTimerPos = FindFontPosition(element.timerPosition or "BOTTOM")
-                timerPosDropdown:SetDefaultText(curTimerPos.label)
-                timerPosDropdown:SetupMenu(function(_, rootDescription)
-                    for _, pos in ipairs(FONT_POSITIONS) do
-                        rootDescription:CreateRadio(pos.label,
-                            function() return (element.timerPosition or "BOTTOM") == pos.key end,
-                            function()
-                                element.timerPosition = pos.key
-                                ApplyChanges()
-                            end)
-                    end
-                end)
-                yOff = yOff - 35
-            end
+            -- Timer text position dropdown
+            Label("Timer Pos:", leftMargin)
+            local timerPosDropdown = CreateFrame("DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
+            timerPosDropdown:SetPoint("TOPLEFT", leftMargin + 80, yOff + 5)
+            timerPosDropdown:SetWidth(150)
+            local curTimerPos = FindFontPosition(element.timerPosition or "BOTTOM")
+            timerPosDropdown:SetDefaultText(curTimerPos.label)
+            timerPosDropdown:SetupMenu(function(_, rootDescription)
+                for _, pos in ipairs(FONT_POSITIONS) do
+                    rootDescription:CreateRadio(pos.label,
+                        function() return (element.timerPosition or "BOTTOM") == pos.key end,
+                        function()
+                            element.timerPosition = pos.key
+                            ApplyChanges()
+                        end)
+                end
+            end)
+            yOff = yOff - 35
 
         elseif element.elementType == "progressbar" then
             SectionHeader("Display (Progress Bar)")
